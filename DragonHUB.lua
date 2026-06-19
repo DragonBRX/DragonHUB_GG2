@@ -131,14 +131,14 @@ end
 -- ══════════════════════════════════════════════
 local function doSell()
     pcall(function()
-        -- Procura o botao de vender em toda a interface e ativa todos os eventos possiveis
-        for _, v in ipairs(LP.PlayerGui:GetDescendants()) do
-            if v.Name == "SellButton" and v:IsA("TextButton") then
-                firesignal(v.MouseButton1Click)
-                firesignal(v.Activated)
-                firesignal(v.MouseButton1Down)
-                firesignal(v.MouseButton1Up)
-                break
+        for _, gui in ipairs(LP.PlayerGui:GetChildren()) do
+            local tb = gui:FindFirstChild("TeleportButtons")
+            if tb then
+                local btn = tb:FindFirstChild("SellButton")
+                if btn then 
+                    firesignal(btn.MouseButton1Click) 
+                    firesignal(btn.Activated)
+                end
             end
         end
     end)
@@ -146,8 +146,28 @@ end
 
 local function doAutoSell()
     while _HUB.AutoSell do
-        doSell()
-        task.wait(2)
+        pcall(function()
+            local bp = LP:FindFirstChild("Backpack")
+            if not bp then return end
+            local hasFruit = false
+            for _, item in ipairs(bp:GetChildren()) do
+                if item:GetAttribute("HarvestedFruit") then
+                    hasFruit = true
+                    break
+                end
+            end
+            local char = getChar()
+            if char then
+                for _, item in ipairs(char:GetChildren()) do
+                    if item:GetAttribute("HarvestedFruit") then
+                        hasFruit = true
+                        break
+                    end
+                end
+            end
+            if hasFruit then doSell() end
+        end)
+        task.wait(3)
     end
 end
 
@@ -291,12 +311,14 @@ local function buildUI()
     Layout.SortOrder    = Enum.SortOrder.LayoutOrder
     Layout.Padding      = UDim.new(0, 6)
 
-    -- Funcao de criacao de toggle (Com camada invisivel para capturar 100% dos toques)
+    -- Funcao de criacao de toggle (Usando TextButton para 100% de precisao no toque)
     local function makeToggle(parent, label, onToggle)
-        local Row = Instance.new("Frame")
+        local Row = Instance.new("TextButton")
         Row.Size             = UDim2.new(1, 0, 0, 40)
         Row.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
         Row.BorderSizePixel  = 0
+        Row.Text             = ""
+        Row.AutoButtonColor  = true
         Row.Parent           = parent
         Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
 
@@ -327,14 +349,6 @@ local function buildUI()
         Ball.Parent           = ToggleFrame
         Instance.new("UICorner", Ball).CornerRadius = UDim.new(1, 0)
 
-        -- Camada invisivel que fica por cima de tudo para garantir o clique
-        local ClickLayer = Instance.new("TextButton")
-        ClickLayer.Size = UDim2.new(1, 0, 1, 0)
-        ClickLayer.BackgroundTransparency = 1
-        ClickLayer.Text = ""
-        ClickLayer.Parent = Row
-        ClickLayer.ZIndex = 5
-
         local state = false
         local function setToggle(val)
             state = val
@@ -349,8 +363,8 @@ local function buildUI()
             onToggle(state)
         end
 
-        -- Ativacao perfeita para Mobile e PC
-        ClickLayer.Activated:Connect(function()
+        -- O evento Activated e perfeito para mobile e PC, corrigindo o problema do clique
+        Row.Activated:Connect(function()
             setToggle(not state)
         end)
 
