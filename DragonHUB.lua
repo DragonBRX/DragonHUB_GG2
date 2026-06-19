@@ -2,21 +2,84 @@ local Players       = game:GetService("Players")
 local RunService    = game:GetService("RunService")
 local TweenService  = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LP            = Players.LocalPlayer
+
+-- Módulos do jogo (necessários pro Steal real)
+local Networking     = require(ReplicatedStorage:WaitForChild("SharedModules"):WaitForChild("Networking"))
+local FruitValueCalc = require(ReplicatedStorage:WaitForChild("SharedModules"):WaitForChild("FruitValueCalc"))
 
 -- ══════════════════════════════════════════════
 -- ESTADO GLOBAL
 -- ══════════════════════════════════════════════
 local _HUB = {
-    AutoHarvest    = false,
-    AutoSell       = false,
-    AutoSteal      = false,
-    StealOwn       = false,
-    MinMutation    = false,
+    AutoHarvest      = false,
+    AutoSell         = false,
+    AutoSteal        = false,
+    StealOwn         = false,
+    MinMutation      = false,
+    StealByDistance  = false, -- false = prioriza valor (padrão), true = prioriza o mais próximo
+    UseTeleportSteal = false, -- false = anda de verdade (mais seguro, mais lento), true = teleporte (rápido, mais arriscado)
 }
 
 local function getChar()
     return LP.Character
+end
+
+local function getRoot(player)
+    local char = player and player.Character
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    return hum and hum.RootPart
+end
+
+local function getMyPlot()
+    local gardens = workspace:FindFirstChild("Gardens")
+    if not gardens then return nil end
+    for _, plot in ipairs(gardens:GetChildren()) do
+        if plot:GetAttribute("OwnerUserId") == LP.UserId then
+            return plot
+        end
+    end
+end
+
+local function isNightTime()
+    local night = ReplicatedStorage:FindFirstChild("Night")
+    return night ~= nil and night.Value == true
+end
+
+local function isPlotUnlocked(player)
+    -- checa se o dono do plot está bloqueando fisicamente a área (anti-steal do próprio jogo)
+    if not player then return true end
+    local gardens = workspace:FindFirstChild("Gardens")
+    if not gardens then return true end
+
+    local plot
+    for _, p in ipairs(gardens:GetChildren()) do
+        if p:GetAttribute("OwnerUserId") == player.UserId then
+            plot = p
+            break
+        end
+    end
+    if not plot then return true end
+
+    local visual = plot:FindFirstChild("Visual")
+    local area   = visual and visual:FindFirstChild("PlotSizeReferenceVisual")
+    if not area then return true end
+
+    local char = player.Character
+    if not char then return true end
+
+    local ok, parts = pcall(function()
+        return workspace:GetPartBoundsInBox(area.CFrame, area.Size)
+    end)
+    if not ok or not parts then return true end
+
+    for _, touching in ipairs(parts) do
+        if touching:IsDescendantOf(char) then
+            return false -- bloqueado
+        end
+    end
+    return true
 end
 
 -- ══════════════════════════════════════════════
@@ -75,54 +138,186 @@ local function doAutoHarvest()
 end
 
 -- ══════════════════════════════════════════════
--- STEAL
+-- STEAL (remote real: Networking.Steal.BeginSteal/CompleteSteal)
 -- ══════════════════════════════════════════════
-local function getStealTargets()
+local function calculateFruitValue(fruit)
+    local ok, value = pcall(function()
+        local fruitName      = fruit:GetAttribute("CorePartName") or fruit:GetAttribute("PlantName")
+        local sizeMultiplier = fruit:GetAttribute("SizeMulti") or fruit:GetAttribute("Age")
+        local mutation       = fruit:GetAttribute("Mutation")
+        return FruitValueCalc(fruitName, sizeMultiplier, mutation, LP, 1)
+    end)
+    return ok and value or 0
+end
+
+-- pega todos os alvos roubáveis, ordenados por valor (padrão) ou distância (opcional)
+local function getStealTargetsSorted()
     local results = {}
-    local myId    = tostring(LP.UserId)
+    local myId    = LP.UserId
     local gardens = workspace:FindFirstChild("Gardens")
     if not gardens then return results end
 
+    local myRoot = getRoot(LP)
+    local myPos  = myRoot and myRoot.Position
+
     for _, plot in ipairs(gardens:GetChildren()) do
+        local ownerUserId = plot:GetAttribute("OwnerUserId")
+        if not ownerUserId or ownerUserId == myId then continue end
+
+        local owner = Players:GetPlayerByUserId(ownerUserId)
+        -- pula se o dono não estiver mais no server (plot pode estar com lixo residual)
         local plants = plot:FindFirstChild("Plants")
         if not plants then continue end
+
+        local function checkFruit(fruitObj)
+            local harvestPart = fruitObj:FindFirstChild("HarvestPart")
+            local stealPrompt = harvestPart and harvestPart:FindFirstChild("StealPrompt")
+            if not stealPrompt then return end
+
+            local value    = calculateFruitValue(fruitObj)
+            local distance = myPos and (harvestPart.Position - myPos).Magnitude or 0
+
+            table.insert(results, {
+                fruit       = fruitObj,
+                harvestPart = harvestPart,
+                value       = value,
+                distance    = distance,
+                userId      = ownerUserId,
+                owner       = owner,
+            })
+        end
+
         for _, plant in ipairs(plants:GetChildren()) do
-            local plantUserId = plant:GetAttribute("UserId")
-            if tostring(plantUserId) == myId then continue end
-
-            local function checkSteal(fruitObj)
-                local harvestPart = fruitObj:FindFirstChild("HarvestPart")
-                if harvestPart then
-                    local prompt = harvestPart:FindFirstChild("StealPrompt")
-                    if prompt and prompt.Enabled then
-                        table.insert(results, {prompt = prompt})
-                    end
-                end
-            end
-
             local fruits = plant:FindFirstChild("Fruits")
             if fruits then
                 for _, fruit in ipairs(fruits:GetChildren()) do
-                    checkSteal(fruit)
+                    checkFruit(fruit)
                 end
+            else
+                checkFruit(plant)
             end
-            checkSteal(plant)
         end
     end
+
+    if _HUB.StealByDistance then
+        table.sort(results, function(a, b) return a.distance < b.distance end)
+    else
+        table.sort(results, function(a, b) return a.value > b.value end)
+    end
     return results
+end
+
+-- move o personagem de verdade até uma posição (sem CFrame/teleporte)
+-- retorna true se chegou, false se timeout ou personagem sumiu
+local function walkTo(position, timeout)
+    timeout = timeout or 8
+    local char = getChar()
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return false end
+
+    hum:MoveTo(position)
+
+    local start = tick()
+    local reached = false
+    local conn
+
+    conn = hum.MoveToFinished:Connect(function(success)
+        reached = true
+    end)
+
+    while tick() - start < timeout do
+        if reached then break end
+        if not _HUB.AutoSteal then break end
+        -- recalcula distância pra considerar "chegou" mesmo sem o evento disparar
+        local curRoot = char and char:FindFirstChild("HumanoidRootPart")
+        if curRoot and (curRoot.Position - position).Magnitude < 4 then
+            break
+        end
+        task.wait(0.1)
+    end
+
+    if conn then conn:Disconnect() end
+    return true
+end
+
+-- teleporta direto via CFrame (rápido, mais arriscado/instável)
+local function teleportTo(position)
+    local root = getRoot(LP)
+    if not root then return false end
+    root.CFrame = CFrame.new(position)
+    task.wait(0.05) -- pequeno respiro pro servidor processar a posição
+    return true
+end
+
+-- escolhe entre andar ou teleportar de acordo com a opção do menu
+local function goTo(position, timeout)
+    if _HUB.UseTeleportSteal then
+        return teleportTo(position)
+    end
+    return walkTo(position, timeout)
+end
+
+local function stealFruit(target)
+    local fruit       = target.fruit
+    local harvestPart = target.harvestPart
+    if not harvestPart then return false end
+
+    local userId  = tonumber(fruit:GetAttribute("UserId")) or target.userId
+    local plantId = fruit:GetAttribute("PlantId")
+    local fruitId = fruit:GetAttribute("FruitId") or ""
+
+    -- se o dono estiver bloqueando fisicamente a área, pula esse alvo
+    if target.owner and not isPlotUnlocked(target.owner) then
+        return false
+    end
+
+    -- vai até a fruta (andando ou teleportando, conforme a opção escolhida)
+    local arrived = goTo(harvestPart.Position, 6)
+    if not arrived or not _HUB.AutoSteal then return false end
+
+    -- checa se ainda existe e ainda é roubável (pode ter sido pego por outro jogador)
+    if not harvestPart.Parent or not harvestPart:FindFirstChild("StealPrompt") then
+        return false
+    end
+
+    Networking.Steal.BeginSteal:Fire(userId, plantId, fruitId)
+    task.wait(0.1)
+    Networking.Steal.CompleteSteal:Fire()
+    return true
+end
+
+-- volta pro próprio jardim pra fruta roubada contar (andando ou teleportando)
+local function returnToPlot()
+    pcall(function()
+        local myPlot = getMyPlot()
+        local ref    = myPlot and myPlot:FindFirstChild("PlotSizeReference")
+        if ref then
+            goTo(ref.Position, 10)
+        end
+    end)
 end
 
 local function doAutoSteal()
     while _HUB.AutoSteal do
         pcall(function()
-            local targets = getStealTargets()
-            for _, t in ipairs(targets) do
-                if not _HUB.AutoSteal then break end
-                fireproximityprompt(t.prompt)
-                task.wait(0.1)
+            if not isNightTime() then
+                return -- só funciona de noite, igual a mecânica do jogo
+            end
+
+            local targets = getStealTargetsSorted()
+            if #targets == 0 then return end
+
+            -- rouba UM fruto por vez e corre de volta antes de tentar o próximo,
+            -- porque ficar carregando vários ao mesmo tempo aumenta a chance de
+            -- alguém te acertar e perder tudo no caminho
+            local best = targets[1]
+            local ok = stealFruit(best)
+            if ok then
+                returnToPlot()
             end
         end)
-        task.wait(1.5)
+        task.wait(0.5)
     end
 end
 
@@ -235,7 +430,7 @@ local function buildUI()
     Title.TextSize           = 13
     Title.TextColor3         = Color3.fromRGB(80, 220, 110)
     Title.TextXAlignment     = Enum.TextXAlignment.Left
-    Title.Text               = "GROW A GARDEN HUB"
+    Title.Text               = "DragonHUB - GROW A GARDEN 2"
     Title.Parent             = Header
 
     -- Botao Minimizar
@@ -390,6 +585,8 @@ local function buildUI()
 
     makeSep(Content, "--- PvP")
     makeToggle(Content, "Auto Steal", function(v) toggleSteal(v) end)
+    makeToggle(Content, "Priorizar Mais Proximo", function(v) _HUB.StealByDistance = v end)
+    makeToggle(Content, "Steal por Teleporte", function(v) _HUB.UseTeleportSteal = v end)
 
     makeSep(Content, "--- Info")
 
@@ -441,8 +638,8 @@ local function buildUI()
                 end
 
                 StatusLbl.Text = string.format(
-                    "  Prontos: %d  |  Backpack: %d",
-                    readyCount, fruitCount
+                    "  Prontos: %d  |  Backpack: %d  |  %s",
+                    readyCount, fruitCount, isNightTime() and "Noite (Steal ON)" or "Dia (Steal OFF)"
                 )
             end)
             task.wait(2)
